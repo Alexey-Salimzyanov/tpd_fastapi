@@ -1,28 +1,8 @@
-# from fastapi import FastAPI, Header
-# import uvicorn
-# import httpx
-
-# app = FastAPI()
-    
-# @app.get("/data")
-# async def get_data(
-#     x_apikey: str = Header(..., alias="X-Apikey")
-# ):
-#     url = "https://api.ciu.nstu.ru/v1.1/student/get_data/react/curriculum"
-    
-#     headers = {
-#         "X-Apikey": x_apikey
-#     }
-    
-#     async with httpx.AsyncClient() as client:
-#         response = await client.get(url, headers=headers)
-        
-#         return response.json()[:20]
-
-# if __name__ == "__main__":
-#     uvicorn.run("main:app", reload=True)
 from fastapi import FastAPI, Header, Depends, HTTPException
+from fastapi_utils.tasks import repeat_every
 from sqlalchemy.orm import Session
+import os
+from dotenv import load_dotenv
 import httpx
 from typing import List, Dict, Any
 import logging
@@ -33,21 +13,54 @@ from models import Curriculum
 from services import ExternalAPIService
 from crud import upsert_curriculums_bulk
 
-# Настройка логирования
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title=settings.PROJECT_NAME)
+
+# Конфигурация из переменных окружения
+API_KEY = os.getenv("EXTERNAL_API_KEY")
+SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL_SECONDS", 3600))
 
 @app.on_event("startup")
 async def startup_event():
     """Создает таблицы при запуске приложения"""
     try:
         Base.metadata.create_all(bind=engine)
-        logger.info("✅ Таблицы базы данных созданы/проверены")
+        logger.info("Таблицы базы данных созданы/проверены")
     except Exception as e:
-        logger.error(f"❌ Ошибка создания таблиц: {e}")
+        logger.error(f"Ошибка создания таблиц: {e}")
         raise
+
+@app.on_event("startup")
+@repeat_every(seconds=SYNC_INTERVAL)
+async def periodic_curriculum_sync():
+    """Периодическая синхронизация учебных планов"""      
+    if not API_KEY:
+        logger.error("API ключ не найден.")
+        return
+    
+    try:
+        logger.info("Запуск периодической синхронизации учебных планов")
+        
+        db = next(get_db())
+        try:
+            api_service = ExternalAPIService()
+            raw_data = await api_service.fetch_curriculum_data(API_KEY)
+            
+            logger.info(f"Получено {len(raw_data)} записей из API")
+            
+            records_processed = upsert_curriculums_bulk(db, raw_data)
+            
+            logger.info(f"Синхронизация завершена. Обработано записей: {records_processed}")
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        logger.error(f"Ошибка при периодической синхронизации: {e}", exc_info=True)
+
 
 @app.get("/")
 async def root():
@@ -59,27 +72,24 @@ async def get_and_store_curriculums(
     db: Session = Depends(get_db)
 ):
     try:
-        logger.info("🔄 Начало получения данных из внешнего API")
+        logger.info("Начало получения данных из внешнего API")
         
         api_service = ExternalAPIService()
         raw_data = await api_service.fetch_curriculum_data(x_apikey)
         
-        logger.info(f"✅ Получено {len(raw_data)} записей из API")
+        logger.info(f"Получено {len(raw_data)} записей из API")
         
-        # Используем upsert вместо простой вставки
         records_processed = upsert_curriculums_bulk(db, raw_data)
-        # Если bulk не работает, используйте ручной вариант:
-        # records_processed = upsert_curriculums_manual(db, raw_data)
         
         return {
             "message": "Data processed successfully",
-            "operation": "upsert",  # Теперь это upsert, а не insert
+            "operation": "upsert",
             "records_processed": records_processed,
             "total_received": len(raw_data)
         }
         
     except Exception as e:
-        logger.error(f"❌ Ошибка: {e}", exc_info=True)
+        logger.error(f"Ошибка: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 if __name__ == "__main__":
